@@ -1,0 +1,449 @@
+---
+title: "WindGusts"
+author: "Gauthier Thurin"
+date: "2023-03-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(GGally)
+library(ExtremalDep)
+library(dplyr)
+library(MASS)
+library(rgl)
+library(knitr)
+library(kableExtra)
+```
+
+```{r functions}
+# ---
+# Functions for estimating the entropic map (our regularized empirical quantile function) 
+# ---
+
+quantile<-function(eps,x,Y,v){
+  # Returns the entropic map at point x with regularization parameter eps.
+  exp = exp( (v-cost(x,Y))  /eps )
+  pi_ = exp / sum(exp) 
+  y_i_pi_i = pi_*Y
+  return( colSums(y_i_pi_i) )
+}
+
+
+superquantile<-function(eps,x,Y,v,N=30){
+  doseur = 1/max(Y)
+  x = transf_inv_Ud(x,doseur)
+  tau = norm(x,type="2")
+  x = x/tau 
+  t = seq(tau,1,length.out=N)
+  tt = matrix(0,nrow=N,ncol=3)
+  for(i in seq(1,N)){
+    tt[i,] = transf_Ud(t[i]*x,doseur)
+  }
+  Qt <- function(u){return(quantile(eps,u,Y,v))}
+  SQx = apply(tt,MARGIN=1,FUN=Qt)
+  SQx = apply(SQx,MARGIN=1,FUN=mean)
+  return(SQx)
+}
+
+cost<- function(x,Y){ # squared euclidean distance between x and the J points of Y. 
+  normdiffx <- function(y,x0=x){ 
+    toto = 0.5*norm(y-x0, type="2")**2
+    return(toto)
+  } #calcule la norme entre un y quelconque et le x considéré
+  # apply this function to each line of Y
+  res = apply(Y,MARGIN=1,FUN=normdiffx) #res must contain J elements
+  return(res)
+}
+
+c_transform <- function(v, x, Y, nu, eps){ #calculate the c-transform of g
+  if(eps>0){
+    arg = (v-cost(x,Y))/eps
+    to_sum = exp(arg)*nu
+    return(-eps*log( sum(to_sum) ) )
+  }else{
+    cost_x = cost(x,Y)
+    return(min(cost_x - v))
+  }
+}
+
+grad_heps <- function(v, x, Y, nu, eps){  #calculate the gradient h_eps
+  if(eps>0){
+    pi = nu * exp( (v-cost(x,Y))/eps )
+    pi = pi/sum(pi)
+    return(nu-pi)
+  }else{
+    cost_x = cost(x,Y)
+    j_star = which.min(cost_x - v)
+    to_return = nu
+    to_return[j_star] = nu[j_star] - 1
+    return(to_return)
+  }
+}
+
+h_eps<- function(v, x, Y, nu, eps){ #Calculate the function h_eps whose expectation equals H_eps.
+  ctransf = c_transform(v,x,Y,nu,eps)
+  return(sum(v*nu) + ctransf - eps)
+}
+
+
+Robbins_Monro_Algo <- function(Y,eps,n_iter,v0=v){
+  #--------------
+  #Function that calculate the approximation of the Wasserstein distance between (the spherical uniform) and nu (empirical measure),
+  #thanks to the Robbins-Monro Stochastic Algorithm. 
+  #Y denotes the support of target distribution nu, and it must have been rescaled to avoid computational issues related to entropic regularization.
+  #--------------
+  c = 0.51
+  gamma = 1
+  
+  J = nrow(Y)
+  d = ncol(Y)
+  nu = rep(1/J,J)
+  doseur = 1/max(Y) #max(Y) must be the max of the transformed Y 
+  
+  # Storage of recursive estimators
+  h_eps_storage = rep(0,n_iter+1)
+  W_hat_storage = rep(0,n_iter+1)
+  
+  # First sample to initiate 
+  Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+  Z = Z/norm(Z,type='2')
+  r = runif(1)
+  x = r*Z
+  x = transf_Ud(x,doseur)
+  
+  h_eps_storage[1] = h_eps(v, x, Y, nu, eps)
+  W_hat_storage[1] = h_eps(v, x, Y, nu, eps)
+  
+  bar_v = v
+  # Robbins Monro algorithm
+  for(k in seq(1,n_iter)){
+    # Sample from mu
+    Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+    Z = Z/norm(Z,type='2')
+    r = runif(1)
+    x = r*Z
+    x = transf_Ud(x,doseur)
+    
+    # Update v
+    v = v + gamma/((k+1)**c) * grad_heps(v, x, Y, nu, eps) 
+    bar_v = ((k-1)/k)*bar_v + v/k
+    
+    # Storage of h_eps at point (x,g).
+    h_eps_storage[k+1] = h_eps(v, x, Y, nu, eps)
+    
+    # approximation of Sinkhorn divergence
+    W_hat_storage[k+1] = (k/(k+1)) * W_hat_storage[k] + 1/(k+1) * h_eps_storage[k+1]
+  }
+  L = list(v, W_hat_storage,bar_v)
+  return(L)
+}
+
+max_corr <- function(Y,eps,n=500){
+  #--------------
+    #- center-reduces the data Y, computes Entropic Optimal Transport via RobbinsMonro,then returns the results in the original scale.
+    # - eps is the regularization parameter of EOT and n is the number of samples drawn from Ud
+  #--------------
+  ### center and reduced
+  moy = apply(Y,MARGIN=2,FUN=mean)
+  maxY = max(Y)
+  transf <- function(u,doseur=2){
+    u = (u - moy)/ (maxY * doseur )
+    return(u)
+  }
+  transf_inv <- function(u,doseur=2){
+    u = u * (maxY * doseur ) + moy
+    return(u)
+  }
+  Y = apply(Y,FUN=transf,MARGIN=1)
+  Y = t(Y)
+  doseur = 1/max(Y) # maximum of the transformed Y
+  v1 = Robbins_Monro_Algo(Y,eps=eps, n_iter=10000)[0]
+  max_corr = 0
+  for(i in seq(1,n)){
+    # Sample from mu
+    Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+    Z = Z/norm(Z,type='2')
+    r = runif(1)
+    x = r*Z
+    x = transf_Ud(x,doseur)
+    TZ = quantile(eps,u,Y,v1)
+    u = transf_inv_Ud(u,doseur)
+    TZ = transf_inv(TZ)
+    max_corr = max_corr + np.dot(u,TZ)
+  }
+  return(max_corr/n)
+}
+
+Norm2 <- function(u){return(norm(u,type="2"))}
+
+VaR_CVaR <- function(Y,eps,tau,v1){
+  #--------------
+  #- computes EOT on center-reduced, and returns the results after rescaling
+  # - returns the VaRs, CVaRs (for the 2-norm )
+  #v1 is the entropic kantorovich potential obtained through the Robbins_Monro_Algo
+  #--------------
+  doseur = 1/max(Y) #maximum of the transformed Y
+  ncq = 400
+  Ud = matrix(0,nrow=ncq,ncol=d)
+  for(i in seq(1,ncq)){
+    Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+    Z = Z/norm(Z,type='2')
+    u = tau*Z
+    u = transf_Ud(u,doseur)
+    Ud[i,] = u
+  }
+  # Quantiles
+  QepsYv <- function(u){return( quantile(eps,u,Y,v1) ) }
+  CQ1 = apply(Ud,MARGIN=1,QepsYv) 
+  normCQ = apply(CQ1, MARGIN = 2,sum)
+  VaR = CQ1[,which.max(normCQ)] 
+  # Superquantiles
+  SepsYv <- function(u){return( superquantile(eps,u,Y,v1) )}
+  CSQ1 = apply(Ud,MARGIN=1,SepsYv) 
+  normCQ = apply(CSQ1, MARGIN = 2,sum)
+  CVaR = CSQ1[,which.max(normCQ)]
+  return(list(VaR,CVaR))
+}
+
+transf_Ud <- function(u,doseur){
+  u = u/doseur
+  return(u)
+}
+transf_inv_Ud <- function(u,doseur){
+  u = u*doseur
+  return(u)
+}
+
+```
+
+
+## Data
+
+
+This markdown presents codes in R about data available at <https://cran.r-project.org/web/packages/ExtremalDep/ExtremalDep.pdf>.
+This data has previously been studied in the following papers.
+- Marcon, G., Naveau, P. and Padoan, S.A. (2017) A semi-parametric stochastic generator for bivariate extreme events
+- Di Bernardino, E. Prieur, C. (2018) Estimation of the multivariate conditional tail expectation for extreme risk levels: Illustration on environmental
+data sets
+- Goegebeur, Y. Guillou ,A. Qin, J. (2023) Dependent conditional tail moments for extreme levels
+
+
+We consider hourly wind gust (WG, in m/s), wind speed (WS, in m/s) and air pressure at sea level (DP, in millibars) recorded at Parçay-Meslay (FRANCE) between July 2004 and July 2013. This dataset is composed of variables of different nature, making it difficult to use aggregation of various components. This is the precise framework where multivariate risk analysis is useful. There are 1450 rows. As in previous studies, we restrict our dataset to 2 weeks maximum of each measurement. 
+
+Our dataset has the following columns :
+• WS: the hourly wind speed in metres per second (m/s);
+• WG: the hourly wind gust in metres per second (m/s);
+• DP: the hourly air pressure at sea level in millibars.
+
+```{r data}
+data(WindSpeedGust)
+years <- format(ParcayMeslay$time, format="%Y")
+data = ParcayMeslay[which(years %in% c(2004:2013)),]
+rm(ParcayMeslay) #pour effacer ParcayMeslay de la mémoire
+data$time <- format(data$time, format="%Y-%U")
+
+#---------------- On se restreint au maximum de chaque semaine
+#initialisation
+w = unique(data$time)[1]
+df = data %>% filter(time == w)
+maxcol<- function(data){
+  return(apply(data,MARGIN=2,FUN=max))
+}
+maxims = maxcol(df)
+newdata = data.frame(t(maxims))
+
+for(w in unique(data$time)[-1]){
+  df = data %>% filter(time == w)
+  maxims = maxcol(df)
+  newdata = rbind(newdata,maxims)
+}
+# ---------------
+rownames(newdata) = newdata$time
+newdata = newdata[, c("WS", "WG", "DP")]
+newdata$WS = as.numeric(newdata$WS)
+newdata$WG = as.numeric(newdata$WG)
+newdata$DP = as.numeric(newdata$DP)
+
+# Y shall contain the data points supposedly drawn from a joint distribution nu in R^d, d=3
+Y = matrix(as.numeric(unlist(newdata)),nrow=nrow(newdata))
+J = nrow(Y)
+d = ncol(Y)
+```
+
+```{r}
+# center and reduce the data Y, for computational aspects related to entropic regularization
+  moy = apply(Y,MARGIN=2,FUN=mean)
+  maxY = max(Y)
+  
+  transf <- function(u,doseur=2){
+    u = (u - moy)/ (maxY * doseur )
+    return(u)
+  }
+  transf_inv <- function(u,doseur=2){
+    u = u * (maxY * doseur ) + moy
+    return(u)
+  }
+  Y = apply(Y,FUN=transf,MARGIN=1)
+  Y = t(Y)
+```
+
+We consider one week maxima of wind gusts. 
+
+```{r data3D}
+ggpairs(newdata[, c("WS", "WG", "DP")])
+ggsave("corplot.png")
+```
+
+This first figure represents our three-dimensional dataset with pair scatterplots under the diagonal and Pearson correlation values above. 
+The diagonal represents empirical density functions of each variable. Upper-right dependence can be observed at first sight and shall be retrieved in the sequel. The physical causes of these positive correlations are quite obvious, as strong wind gusts occur with stormy weather, during which strong wind speed and high air pressure are frequently recorded. 
+
+
+```{r convergence vars, eval = FALSE}
+#this chunk learns the optimal kantorovich potential while saving iterates in a list
+eps = 0.001
+n = 30
+J = nrow(Y)
+v = runif(J)
+v = v - mean(v)
+liste_v = matrix(0,nrow=J,ncol=n+1) #each column will be a v
+liste_v[,1] = v
+for(i in seq(1,n)){
+  #at each i, computes 1000 iterations, keeps the v, and continue from the same v. 
+  v = Robbins_Monro_Algo(Y,eps=eps, n_iter=1000,v0=v)[[1]]
+  liste_v[,i+1] = v
+  print(i)
+  print(v[1])
+}
+```
+
+
+```{r}
+#v = liste_v[,n+1]
+v = Robbins_Monro_Algo(Y,eps=eps, n_iter=20000,v0=v)[[1]]
+```
+
+
+```{r plot3d}
+
+x = 1:3
+y = 1:3
+z = 1:3
+xc = 1:3
+yc = 1:3
+zc = 1:3
+
+i = 1
+for(alpha in c(0.25,0.5,0.75)){
+  print(alpha)
+  resultats = VaR_CVaR(Y,eps,alpha,v)
+  VaR = transf_inv(resultats[[1]])
+  CVaR = transf_inv(resultats[[2]])
+  x[i] = VaR[1] ; y[i] = VaR[2] ; z[i] = VaR[3]
+  xc[i] = CVaR[1] ; yc[i] = CVaR[2] ; zc[i] = CVaR[3]
+  i = i + 1 
+}
+
+```
+
+```{r}
+i = 1
+ws = newdata$WS
+wg = newdata$WG
+dp = newdata$DP
+plot3d(ws,wg,dp,type="s",radius=0.2,col="red") 
+for(tau in c(1,1.25,1.5)){
+  spheres3d(x[i],y[i],z[i],col="blue",radius = tau) 
+  spheres3d(xc[i],yc[i],zc[i],col="green",radius = tau) 
+  i = i + 1 
+}
+legend3d("topright", legend = paste(c('VaR', 'CVaR')), pch = 16, col = c("blue","green"), cex=1, inset=c(0.02))
+rgl.snapshot("rgl_3_R.gif")
+```
+
+```{r}
+i = 1
+plot3d(ws,wg,dp,type="s",radius=0.2,col="red") 
+tau = 1
+spheres3d(x[i],y[i],z[i],col="blue",radius = tau) 
+spheres3d(xc[i],yc[i],zc[i],col="green",radius = tau) 
+legend3d("topright", legend = paste(c('VaR', 'CVaR')), pch = 16, col = c("blue","green"), cex=1, inset=c(0.02))
+rgl.snapshot("rgl_3_R5.png")
+```
+
+```{r}
+i = 2
+plot3d(ws,wg,dp,type="s",radius=0.2,col="red") 
+tau = 1
+spheres3d(x[i],y[i],z[i],col="blue",radius = tau) 
+spheres3d(xc[i],yc[i],zc[i],col="green",radius = tau) 
+legend3d("topright", legend = paste(c('VaR', 'CVaR')), pch = 16, col = c("blue","green"), cex=1, inset=c(0.02))
+rgl.snapshot("rgl_3_R7.png")
+```
+
+```{r}
+i = 3
+plot3d(ws,wg,dp,type="s",radius=0.2,col="red") 
+tau = 1
+spheres3d(x[i],y[i],z[i],col="blue",radius = tau) 
+spheres3d(xc[i],yc[i],zc[i],col="green",radius = tau) 
+legend3d("topright", legend = paste(c('VaR', 'CVaR')), pch = 16, col = c("blue","green"), cex=1, inset=c(0.02))
+rgl.snapshot("rgl_3_R9.png")
+```
+
+
+
+```{r}
+VaRs = rbind(x,y,z)
+colnames(VaRs) = c("0.25","0.5","0.75")
+rownames(VaRs) = colnames(newdata)
+CVaRs = rbind(xc,yc,zc)
+colnames(CVaRs) = c("0.25","0.5","0.75")
+rownames(CVaRs) = colnames(newdata)
+
+kableVars = kable(VaRs, "latex", booktabs = T) %>%
+  kable_styling(latex_options = c("striped", "scale_down")) %>%
+  as_image()
+
+
+kableCVars = kable(CVaRs, "latex", booktabs = T) %>%
+  kable_styling(latex_options = c("striped", "scale_down")) %>%
+  as_image() 
+```
+```{r}
+plot(newdata$WS,newdata$WG)
+points(VaRs[1,],VaRs[2,],col='blue',bg='blue',pch = 21)
+points(CVaRs[1,],CVaRs[2,],col='green',bg='green',pch = 21)
+```
+
+
+```{r}
+plot(newdata$WS,newdata$DP)
+points(VaRs[1,],VaRs[3,],bg = 'blue',col='blue',pch = 21)
+points(CVaRs[1,],CVaRs[3,],col='green',bg='green',pch = 21)
+```
+
+The previous figure illustrates that our vectorial risk measures have caught the three dimensional tails of the empirical distribution. With the increase of the dimension, such plots are no longer convenient. These measurements can be retrieved through tables, as the ones given in figure ... This summarizes the targeted information contained in the dataset. For instance, with a given probability 0.5, 0.7 or 0.9, one shall expect, at worst, wind gusts of respective speed 19.17, 22.07, 33.49 m/s. With same probability, averaged observations beyond these worst shall be expected around 24.8, 28.16, or 33.9 m/s. After that, the practitioner can put these measurements into perspective with the usual magnitude of wind gusts, to interpret these risk values. 
+
+Alternatively, one can compare different risky locations from the same dataset. The same measurements have been collected from Lingen, in Germany in a dataset with 1083 rows. Measurements are recorded between January 1982 and June 2003. By comparing VaRs and CVaRs, strong wind gusts are more likely to occur in ... than in .... + details 
+
+
+```{r}
+kableVars
+```
+
+```{r}
+summary(newdata$WG)
+```
+
+As a comparison, univariate quantiles of the variable WG render underestimated risks, as one can see in the table ... 
+
+
+```{r}
+kableCVars
+```
+
+
+
+

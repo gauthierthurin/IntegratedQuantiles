@@ -1,0 +1,1059 @@
+---
+title: "Codes_figures"
+author: "Gauthier Thurin"
+date: "2023-03-15"
+output: html_document
+---
+
+```{r libraries}
+library(plotly)
+library(ggpubr)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(latex2exp)
+library(future)
+plan(multisession)
+mvrnorm = MASS::mvrnorm
+```
+
+```{r}
+t = 8*(-1000:1000)/1000
+sd = 2
+sd2 = sd**2
+
+f <- function(x){
+  return( exp(-x**2/(2*sd2))/sqrt(2*pi*sd2) )
+}
+
+densite = t
+i=1
+for (x in t){
+  densite[i] = f(x)
+  i = i+1
+}
+  
+subset = t[t>=qnorm(.95,mean=0,sd=sd)]
+S=0
+proba = 0
+i=1
+for (x in subset){
+  S = S+x*f(x)
+  proba = proba + f(x)
+  i = i+1
+}
+S = S/proba
+ES = -S
+
+
+df = cbind(t,densite)
+df = as.data.frame(df)
+p <- ggplot(data=df, aes(x=t, y=densite)) + geom_point(size=0.01) + theme(axis.title = element_blank(),axis.text = element_blank(),axis.ticks = element_blank()) 
+p = p + geom_segment(aes(x = qnorm(.95,mean=0,sd=sd), y = 0, xend = qnorm(.95,mean=0,sd=sd), yend = 0.12),color="blue",linetype="dashed")
+p = p+ annotate("text", x = qnorm(.95,mean=0,sd=sd)+0.1, y = 0.13, label = TeX("$Q(1-\\alpha)$"),color="blue",size=4)
+p = p + geom_segment(aes(x = qnorm(0.05,mean=0,sd=sd), y = 0, xend = qnorm(0.05,mean=0,sd=sd), yend = 0.12),color="blue",linetype="dashed")
+p = p+ annotate("text", x = qnorm(0.05,mean=0,sd=sd), y = 0.13, label = TeX("$Q(\\alpha)$"),color="blue",size=4)
+p = p + geom_segment(aes(x = S, y = 0, xend = S, yend = 0.05),color="black",linetype="dashed")
+p = p+ annotate("text", x = S+0.5, y = 0.06, label = TeX("$S(1-\\alpha)$"),color="black",size=4)
+p = p + geom_segment(aes(x = ES, y = 0, xend = ES, yend = 0.05),color="black",linetype="dashed")
+p = p+ annotate("text", x = ES-0.3, y = 0.06, label = TeX("$E(\\alpha)$"),color="black",size=4)
+p = p + geom_area(data = df[t>=qnorm(.95,mean=0,sd=sd),], fill = rgb(0, 0, 1, 0.5)) + geom_area(data = df[t<=qnorm(0.05,mean=0,sd=sd),], fill = rgb(0, 0, 1, 0.5))
+p
+ggsave("plot.png",height=2,width=4)
+```
+
+The computation of Monge-Kantorovich quantiles relies on the minimization of the optimal transport problem. We use a Robbins-Monro algorithm for solving OT with entropic regularization. For computational reasons, the problem of optimal transport is solved on scaled data. After having scaled `Y`, one can use the function `Robbins_Monro_algo`, to solve the EOT problem between `Y` and $U_d$. With the resulting potential `v`, one can use the functions `quantile` and `superquantile` or `expshort` to infer the objects of the same name.
+
+One can use `transf_inv` to render the data and the quantile/superquantile points in original scale.
+
+The next cell defines all the functions.
+
+```{r functions for OT}
+# ---
+# Functions for estimating the entropic map (our regularized empirical quantile function) 
+# ---
+
+quantile<-function(eps,x,Y,v){
+  # Returns the entropic map at point x with regularization parameter eps.
+  exp = exp( (v-cost(x,Y))  /eps )
+  pi_ = exp / sum(exp) 
+  y_i_pi_i = pi_*Y
+  return( colSums(y_i_pi_i) )
+}
+
+superquantile<-function(eps,x,Y,v,N=30){
+  tau = norm(x,type="2")
+  x = x/tau 
+  t = seq(tau,1,length.out=N)
+  tt = matrix(0,nrow=N,ncol=d)
+  for(i in seq(1,N)){
+    tt[i,] = t[i]*x
+  }
+  Qt <- function(u){return(quantile(eps,u,Y,v))}
+  # parallelized work
+  N4 = floor(N/4)
+  a %<-% apply(tt[1:N4,],MARGIN=1,FUN=Qt)
+  b %<-% apply(tt[(N4+1):(2*N4),],MARGIN=1,FUN=Qt)
+  c %<-% apply(tt[(2*N4+1):(3*N4),],MARGIN=1,FUN=Qt)
+  d %<-% apply(tt[(3*N4+1):N,],MARGIN=1,FUN=Qt)
+  a = cbind(a,b,c,d)
+  return(rowMeans(a))
+}
+
+expshort <-function(eps,x,Y,v,N=30){
+  tau = norm(x,type="2")
+  x = x/tau 
+  t = seq(0,tau,length.out=N)
+  tt = matrix(0,nrow=N,ncol=d)
+  for(i in seq(1,N)){
+    tt[i,] = t[i]*x
+  }
+  Qt <- function(u){return(quantile(eps,u,Y,v))}
+  # parallelized work
+  N4 = floor(N/4)
+  a %<-% apply(tt[1:N4,],MARGIN=1,FUN=Qt)
+  b %<-% apply(tt[(N4+1):(2*N4),],MARGIN=1,FUN=Qt)
+  c %<-% apply(tt[(2*N4+1):(3*N4),],MARGIN=1,FUN=Qt)
+  d %<-% apply(tt[(3*N4+1):N,],MARGIN=1,FUN=Qt)
+  a = cbind(a,b,c,d)
+  return(rowMeans(a))
+}
+
+cost<- function(x,Y){ # squared euclidean distance between x and the J points of Y. 
+  normdiffx <- function(y,x0=x){ 
+    toto = 0.5*norm(y-x0, type="2")**2
+    return(toto)
+  } #calcule la norme entre un y quelconque et le x considéré
+  # apply this function to each line of Y
+  res = apply(Y,MARGIN=1,FUN=normdiffx) #res must contain J elements
+  return(res)
+}
+
+c_transform <- function(v, x, Y, nu, eps){ #calculate the c-transform of g
+  if(eps>0){
+    arg = (v-cost(x,Y))/eps
+    to_sum = exp(arg)*nu
+    return(-eps*log( sum(to_sum) ) )
+  }else{
+    cost_x = cost(x,Y)
+    return(min(cost_x - v))
+  }
+}
+
+grad_heps <- function(v, x, Y, nu, eps){  #calculate the gradient h_eps
+  if(eps>0){
+    pi = nu * exp( (v-cost(x,Y))/eps )
+    return(nu-pi/sum(pi))
+  }else{
+    cost_x = cost(x,Y)
+    j_star = which.min(cost_x - v)
+    to_return = nu
+    to_return[j_star] = nu[j_star] - 1
+    return(to_return)
+  }
+}
+
+h_eps<- function(v, x, Y, nu, eps){ #Calculate the function h_eps whose expectation equals H_eps.
+  ctransf = c_transform(v,x,Y,nu,eps)
+  return(sum(v*nu) + ctransf - eps)
+}
+
+
+Robbins_Monro_Algo <- function(Y,eps,n_iter,v0){
+  #--------------
+  #Function that calculate the approximation of the Wasserstein distance between (the spherical uniform) and nu (empirical measure),
+  #thanks to the Robbins-Monro Stochastic Algorithm. 
+  #Y denotes the support of target distribution nu, and it must have been rescaled to avoid computational issues related to entropic regularization.
+  #--------------
+  c = 0.51
+  gamma = 1
+  
+  J = nrow(Y)
+  d = ncol(Y)
+  nu = rep(1/J,J)
+  #doseur = 1/max(Y) #max(Y) must be the max of the transformed Y 
+  
+  v = v0
+  # Robbins Monro algorithm
+  for(k in seq(1,n_iter)){
+    # Sample from mu
+    Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+    Z = Z/norm(Z,type='2')
+    r = runif(1)
+    x = r*Z
+    
+    # Update v
+    v = v + gamma/((k+1)**c) * grad_heps(v, x, Y, nu, eps) 
+  }
+  return(v)
+}
+
+
+```
+
+# Density of our reference distribution in logarithmic scale
+
+```{r}
+# log-density of Ud
+f <- function(x,y){
+  if(x**2 + y**2 <= 1){
+    res = log(1/sqrt(x**2+y**2))
+  }else{
+    res = NaN
+  }
+  return(res)
+}
+
+N = 100
+seqx = seq(-1,1,length.out=N)
+Z = matrix(-1,nrow=N,ncol=N)
+
+for(i in 1:N){
+  for(j in 1:N){
+    Z[i,j] = f(seqx[i],seqx[j])
+  }
+}
+
+```
+
+```{r}
+# Z is a numeric matrix that ships with R
+fig <- plot_ly(x=seqx,y=seqx,z = ~Z,colors="BrBG")
+fig <- fig %>% add_surface() %>% hide_colorbar()
+fig
+```
+
+# Banana-shaped data
+
+```{r}
+J = 2000
+d = 2
+
+# We simulate the banana shaped distribution 
+X = -1 + 2 * runif(J)
+Phi = 2 * pi * runif(J)
+R = 0.2 * runif(J) * (1+(1-abs(X))/2)
+Y = cbind( X + R * cos(Phi) , X**2 + R * sin(Phi) )
+
+rm(X) ; rm(R) ; rm(Phi)  #pour effacer de la mémoire
+
+plot(Y[,1],Y[,2])
+
+```
+
+```{r simu banana shaped low curve}
+J = 2000
+d = 2
+
+# We simulate the banana shaped distribution 
+X = -1 + 2 * runif(J)
+e = mvrnorm(n=J,mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+phi = 1+(3/2)*sin(X*pi/2)**2
+e2 = e[,2]/1.15 + 0.5*(e[,1]**2+1.21)
+X = cbind( X + 1.15*e[,1]*phi, X**2 + phi*e2 )
+
+plot(X[,1],X[,2],col="blue")
+points(Y[,1],Y[,2])
+```
+
+```{r}
+# center and reduce the data Y, for computational aspects related to entropic regularization
+moy = apply(Y,MARGIN=2,FUN=mean)
+maxY = max(Y)
+  
+transf <- function(u,doseur=2){
+  u = (u - moy)/ (maxY * doseur )
+  return(u)
+}
+transf_inv <- function(u,doseur=2){
+  u = u * (maxY * doseur ) + moy
+  return(u)
+}
+Y = apply(Y,FUN=transf,MARGIN=1)
+Y = t(Y)
+plot(Y[,1],Y[,2],col="grey")
+```
+
+```{r}
+eps = 0.005
+v = runif(J)
+v = v - mean(v)
+v = Robbins_Monro_Algo(Y,eps=eps, n_iter=20000,v0=v)
+```
+
+After that, the center-outward quantile function can be applied to any $u\in \mathbb{B}(0,1)$.
+
+```{r}
+u = c(0.2,0.7)
+Qu = quantile(eps,u,Y,v)
+Qu
+```
+
+In dimension 2, one can see that this quantile function indeed characterizes the target distribution on the following plot. The next cell just compute `Q(U)` for a sample drawn from $U_d$.
+
+```{r}
+Ud = matrix(0,nrow=500,ncol=d)
+for(i in seq(1,500)){
+  Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+  Z = Z/norm(Z,type='2')
+  Ud[i,] = runif(1)*Z
+}
+
+ImgUd = apply(Ud,MARGIN=1,function(u){return(quantile(eps,u,Y,v)) })
+
+plot(Y[,1],Y[,2],col="grey")
+points(ImgUd[1,],ImgUd[2,],col="blue")
+legend("top", legend = c("Y", "Q(U)"), col = c("grey", "blue"), pch = 15, bty = "n", pt.cex = 2, cex = 0.8, horiz = TRUE, inset = c(0.1, 0.1))
+```
+
+## Contours on the unit ball
+
+```{r}
+m = 2000
+Ud = matrix(0,nrow=m,ncol=d)
+for(i in seq(1,m)){
+  Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+  Z = Z/norm(Z,type='2')
+  Ud[i,] = runif(1)*Z
+}
+Ud = cbind(Ud,rep("Ud",m))
+
+
+ncq = 1000
+sphere = matrix(0,nrow=ncq,ncol=d)
+for(i in seq(1,ncq)){
+  Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+  Z = Z/norm(Z,type='2')
+  sphere[i,] = Z
+}
+
+N = 15
+N2 = 30
+angles = seq(0,2*pi,length.out=N)
+data = matrix(0,nrow=N*N2,ncol=2)
+
+for(k in 1:N){
+  theta = angles[k]
+  r = seq(0,1,length.out=N2)
+  xs = round(r * cos(theta),3)
+  ys = round(r * sin(theta),3)
+  us = cbind(xs,ys )
+  data[(1:N2)+(k-1)*N2,] = us
+}
+data = cbind(data,rep("Sign",N*N2))
+
+rayons = c(0.1,0.3,0.5,0.7,0.9)
+
+for(tau in rayons){
+  contour = tau*sphere
+  contour = cbind(contour,rep("Contours",ncq))
+  data = rbind(as.matrix(data),contour)
+}
+
+data = rbind(Ud,data)
+data = as.data.frame(data)
+colnames(data) = c("x","y","type")
+data[ , 1:2] <- apply(data[ , 1:2], MARGIN = 2,function(x) as.numeric(x))
+
+
+data[ , 1:2] <- apply(data[ , 1:2], MARGIN = 2,function(x) as.numeric(x))
+
+p = ggplot(data,mapping = aes(x=x, y=y,colour=type)) + geom_point(size=0.5) + theme(legend.position = "none",axis.text= element_blank(),axis.ticks = element_blank(),axis.title = element_blank()) + scale_color_manual(values = c("blue","red","gray") )
+for(k in 1:N){
+  df = data[data$type=="Sign",]
+  p = p + geom_path(df[(1:N2)+(k-1)*N2,],mapping=aes(x=x, y=y,colour=type),linewidth=1) 
+}
+p1 = p
+p
+```
+
+## Quantile contours 
+
+```{r quantile contours}
+QepsYv <- function(u){return( quantile(eps,u,Y,v) ) }
+radius <- function(theta){ 
+  r = seq(0,1,length.out=30)
+  us = cbind(round(r * cos(theta),3), round(r * sin(theta),3) )
+  return(us)
+}
+signcurvesQ <- function(angles){
+  list_of_dfs = lapply(angles,function(theta){ return(apply(radius(theta),MARGIN=1,QepsYv) ) })
+  Reduce(cbind, list_of_dfs)
+}
+angles = seq(0,2*pi,length.out=15) #N=15
+SCQ = signcurvesQ(angles) # 2 rows, N*N2 columns
+SCQ = rbind(SCQ,rep("Signs",N*N2))
+
+ncq = 500
+sphere = matrix(0,nrow=ncq,ncol=d)
+angles2 = seq(0,2*pi,length.out=ncq)
+for(i in seq(1,ncq)){
+  theta = angles2[i]
+  u = c(round(cos(theta),3),round(sin(theta),3))
+  sphere[i,] = u
+}
+avoid_copyQ <- function(rayons){
+  list_of_dfs = lapply(rayons,function(tau){ return(apply(tau*sphere,MARGIN=1,QepsYv) ) })
+  return(Reduce(cbind, list_of_dfs))
+} #returns an object of size (d,ncq*length(rayons)) 
+
+len = length(rayons)
+CQ <- avoid_copyQ(rayons)
+CQ = rbind(CQ,rep("Contours",len*ncq))
+
+
+Y2 = Y[1:2000,]
+
+# Visualization with ggplot
+SCQ = t(cbind(SCQ,CQ))
+SCQ = rbind(cbind(Y2,rep("Y",nrow(Y2))),SCQ)
+SCQ = as.data.frame(SCQ)
+colnames(SCQ) = c("x","y","type")
+SCQ[ , 1:2] <- apply(SCQ[ , 1:2], MARGIN = 2,function(x) as.numeric(x))
+
+pQ = ggplot(SCQ,aes(x=x, y=y,colour=type)) + geom_point(size=0.5) + theme(legend.position = "none",axis.title=element_blank()) + scale_color_manual(values = c("blue","red","gray") )
+for(k in 1:N){
+  df = SCQ[SCQ$type=="Signs",]
+  pQ = pQ + geom_path(df[(1:N2)+(k-1)*N2,],mapping=aes(x=x, y=y,colour=type),linewidth=1) 
+}
+
+pQ
+#ggsave("BananeCouchee_QuantilesSignes0001.png")
+```
+
+## Expected shortfall and superquantile contours 
+
+```{r expshort and superquantiles contours}
+SepsYv <- function(u){return( superquantile(eps,u,Y,v) )}
+EepsYv <- function(u){return( expshort(eps,u,Y,v) )}
+
+##################################### 
+#BEGIN TO COMPUTE SIGN CURVES IN A FORMAT THAT GGPLOT UNDERSTANDS
+##################################### 
+radiusE <- function(theta){  
+  r = c(seq(0,0.03,length.out=5),seq(0.05,1,length.out=25))
+  us = cbind(round(r * cos(theta),3), round(r * sin(theta),3) )
+  return(us)
+}
+#different radius for expected shortfall (near from the origin)
+radius <- function(theta){ 
+  r = seq(0,1,length.out=30)
+  us = cbind(round(r * cos(theta),3), round(r * sin(theta),3) )
+  return(us)
+}
+signcurvesS <- function(angles){
+  list_of_dfs = lapply(angles,function(theta){ return(apply(radius(theta),MARGIN=1,SepsYv) ) })
+  Reduce(cbind, list_of_dfs)
+}
+signcurvesE <- function(angles){
+  list_of_dfs = lapply(angles,function(theta){ return(apply(radiusE(theta),MARGIN=1,EepsYv) ) })
+  Reduce(cbind, list_of_dfs)
+}
+
+angles = seq(0,2*pi,length.out=15) #N=15
+
+SCS = signcurvesS(angles)
+SCS = rbind(SCS,rep("Signs",N*N2)) #N2=30, nb of elements in radius
+
+SCE = signcurvesE(angles) 
+SCE = rbind(SCE,rep("Signs",N*N2)) 
+
+#####################################
+# END
+##################################### 
+
+#####################################################
+## BEGIN TO COMPUTE SIGN CURVES IN A FORMAT THAT GGPLOT UNDERSTANDS 
+#####################################################
+ncq = 500 #size of a unit contour
+sphere = matrix(0,nrow=ncq,ncol=d)
+angles2 = seq(0,2*pi,length.out=ncq)
+for(i in seq(1,ncq)){
+  theta = angles2[i]
+  u = c(round(cos(theta),3),round(sin(theta),3))
+  sphere[i,] = u
+}
+
+avoid_copyS <- function(rayons){
+  list_of_dfs = lapply(rayons,function(tau){ return(apply(tau*sphere,MARGIN=1,SepsYv) ) })
+  return(Reduce(cbind, list_of_dfs))
+}
+avoid_copyE <- function(rayons){
+  list_of_dfs = lapply(rayons,function(tau){ return(apply(tau*sphere,MARGIN=1,EepsYv) ) })
+  return(Reduce(cbind, list_of_dfs))
+}
+# we use avoid_copyQ and avoid_copyS to save memory 
+CS <- avoid_copyS(rayons)
+CE <- avoid_copyE(rayons)
+
+len = length(rayons)
+CS = rbind(CS,rep("Contours",len*ncq))
+CE = rbind(CE,rep("Contours",len*ncq))
+
+######################################################
+# END
+######################################################
+
+G = 5000
+X = -1 + 2 * runif(G)
+Phi = 2 * pi * runif(G)
+R = 0.2 * runif(G) * (1+(1-abs(X))/2)
+Y2 = cbind( X + R * cos(Phi) , X**2 + R * sin(Phi) )
+moy = apply(Y2,MARGIN=2,FUN=mean)
+maxY = max(Y2)
+Y2 = apply(Y2,FUN=transf,MARGIN=1)
+Y2 = t(Y2)
+
+# SUPERQUANTILES
+SCS = t(cbind(SCS,CS))
+SCS = rbind(cbind(Y2,rep("Y",nrow(Y2))),SCS)
+SCS = as.data.frame(SCS)
+colnames(SCS) = c("x","y","type")
+SCS[ , 1:2] <- apply(SCS[ , 1:2], MARGIN = 2,function(x) as.numeric(x))
+# EXPECTED SHORTFALL
+SCE = t(cbind(SCE,CE))
+SCE = rbind(cbind(Y2,rep("Y",nrow(Y2))),SCE)
+SCE = as.data.frame(SCE)
+colnames(SCE) = c("x","y","type")
+SCE[ , 1:2] <- apply(SCE[ , 1:2], MARGIN = 2,function(x) as.numeric(x))
+
+# GRAPHICS
+
+pS = ggplot(SCS,aes(x=x, y=y,colour=type)) + geom_point(size=1) + theme_bw()+ theme(legend.position = "none",axis.title= element_blank()) + scale_color_manual(values = c("blue","red","gray") ) 
+#for(k in 1:N){
+#  df = SCS[SCS$type=="Contours",]
+#  pS = pS + geom_path(df[(1:N2)+(k-1)*N2,],mapping=aes(x=x, y=y,colour=type),linewidth=1) 
+#}
+for(k in 1:N){
+  df = SCS[SCS$type=="Signs",]
+  pS = pS + geom_path(df[(1:N2)+(k-1)*N2,],mapping=aes(x=x, y=y,colour=type),linewidth=1) 
+}
+
+pE = ggplot(SCE,aes(x=x, y=y,colour=type)) + geom_point(size=1) + theme_bw() + theme(legend.position = "none",axis.title= element_blank()) + scale_color_manual(values = c("blue","red","gray") )
+#for(k in 1:len){
+#  df = SCE[SCE$type=="Contours",]
+#  pE = pE + geom_path(df[(1:ncq)+(k-1)*ncq,],mapping=aes(x=x, #y=y,colour=type),linewidth=1) 
+#}
+for(k in 1:N){
+  df = SCE[SCE$type=="Signs",]
+  pE = pE + geom_path(df[(1:N2)+(k-1)*N2,],mapping=aes(x=x, y=y,colour=type),linewidth=1) 
+}
+```
+
+```{r}
+pE
+#ggsave("BananeCouchee_expshort0005.png",height=10,width=10)
+pS
+#ggsave("BananeCouchee_SuperQuantilesSignes0005.png",height=10,width=10)
+```
+
+## Graphical stuff
+
+```{r gridExtra ie the arrow}
+
+b = nullGrob()
+mygb = function(x,y) {
+  grid.bezier(x=x, y=y, gp=gpar(fill="black"), 
+              arrow=arrow(type="closed", length=unit(2,"mm")))
+}
+pQ = pQ + theme(legend.position = "none",axis.text= element_blank(),axis.ticks = element_blank(),axis.title = element_blank())
+
+grid.arrange(arrangeGrob(b, p1, b, heights=c(0.25,0.5,0.25)),
+             b,
+             arrangeGrob(b, pQ, b, heights=c(0.1,0.8, 0.1)),
+             ncol=3, widths=c(0.35,0.1,0.55))
+
+#grid.arrange(b,b,pQ,ncol=3, widths=c(0.3,0.1,0.3))
+
+vp = viewport(x = 0.4, y=.5, width=0.09, height=0.4)
+pushViewport(vp)
+#grid.rect(gp=gpar(fill="black", alpha=0.1))
+# Add top set of arrows
+mygb(x=c(0,0.5,0.8,1), y=c(0.5,0.6,0.6,0.5))
+popViewport()
+#ggsave("Qmap_arrow.png",height=2,width=5)
+```
+
+# VaRs and CVaRs on simulated data
+
+## Functions
+
+```{r functions}
+
+simu <- function(mean1,sigma1,mean2,sigma2,J){
+  Y1 = mvrnorm(n=J,mu=mean1,Sigma=sigma1)
+  Y2 = mvrnorm(n=J,mu=mean2,Sigma=sigma2)
+  t = min(min(Y1),min(Y2))
+  Y1 = Y1 + rep(abs(t),2)
+  Y2 = Y2 + rep(abs(t),2)
+  return(list(Y1,Y2))
+}
+
+max_corr <- function(Y,eps,n=500,v1,moy,maxY){
+  #--------------
+    # - eps is the regularization parameter of EOT and n is the number of samples drawn from Ud
+  #--------------
+  transf_inv <- function(u){return(u * (maxY * 2 ) + moy)}
+  doseur = 1/max(Y)
+  Ud = matrix(0,nrow=n,ncol=2)
+  for(i in seq(1,n)){
+    # Sample from mu
+    Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+    Z = Z/norm(Z,type='2')
+    r = runif(1)
+    Ud[i,] = r*Z
+  }
+  # Quantiles
+  QepsYv <- function(u){return( transf_inv(quantile(eps,u,Y,v1)) ) }
+  TZ = apply(Ud,MARGIN=1,QepsYv) 
+  res = colSums( aperm(Ud) * TZ) #contient les produits scalaires entre u et Q(u)
+  return(mean(res))
+}
+
+VaR_CVaR <- function(Y,eps,tau,v1,moy,maxY){
+  #--------------
+  # - returns the VaRs, CVaRs (for the 2-norm )
+  #- computes EOT on center-reduced, and returns the results after rescaling in original scale
+  #v1 is the entropic kantorovich potential obtained through the Robbins_Monro_Algo
+  #--------------
+  ncq = 500
+  angles = seq(0,2*pi,length.out=ncq)
+  Ud = matrix(0,nrow=ncq,ncol=d)
+  for(i in seq(1,ncq)){
+    theta = angles[i]
+    u = tau * c(round(cos(theta),3),round(sin(theta),3))
+    Ud[i,] = u
+  }
+  transf_inv <- function(u){return(u * (maxY * 2 ) + moy)}
+  # Quantiles
+  QepsYv <- function(u){return( quantile(eps,u,Y,v1) ) }
+  CQ1 = apply(Ud,MARGIN=1,QepsYv) 
+  CQ1 = apply(CQ1, MARGIN = 2,FUN=transf_inv)
+  normCQ = apply(CQ1, MARGIN = 2,sum)
+  VaR = CQ1[,which.max(normCQ)] 
+  # Superquantiles
+  SepsYv <- function(u){return( superquantile(eps,u,Y,v1) )}
+  CSQ1 = apply(Ud,MARGIN=1,SepsYv)
+  CSQ1 = apply(CSQ1, MARGIN = 2,FUN=transf_inv)
+  normCQ = apply(CSQ1, MARGIN = 2,sum)
+  CVaR = CSQ1[,which.max(normCQ)]
+  return(list(VaR,CVaR,CQ1,CSQ1))
+}
+
+calculs <- function(Y,tau,eps){
+  J = nrow(Y)
+  moy = apply(Y,MARGIN=2,FUN=mean)
+  maxY = max(Y)
+  transf <- function(u){return( (u - moy)/ (maxY * 2 ) )}
+  transf_inv <- function(u){return(u * (maxY * 2 ) + moy)}
+  Y = apply(Y,FUN=transf,MARGIN=1) 
+  Y = t(Y)
+  
+  v = runif(J)
+  v = v - mean(v)
+  v = Robbins_Monro_Algo(Y,eps=eps, n_iter=20000,v0=v)
+  
+  res = VaR_CVaR(Y,eps,tau,v1=v,moy,maxY) #transf and transf_inv are used here
+  VaR = res[[1]]
+  CVaR = res[[2]]
+  
+  MC = max_corr(Y=Y,eps=eps,v1=v,moy=moy,maxY=maxY) #transf and transf_inv are used here
+  risks = list(VaR,CVaR,MC) 
+  
+  CQ = res[[3]]
+  CS = res[[4]]
+  
+  contours = list(CQ,CS)
+  # the results are in the original scale 
+  return(list(risks,contours))
+}
+
+#with the contours : 
+plot_situ <- function(contours,palette,VaR, CVaR, Y,limx,limy){
+  # returns a graph with Y, some contours with respective Var and CVaR
+  # palette must be either 1 or 2
+  # -------------------------------------
+  df1 = rbind(contours[[1]],rep("Q",500))
+  df2 = rbind(contours[[2]],rep("S",500))
+  df1 = t(cbind(df1,df2))
+  df1 = rbind(df1,cbind(Y,rep("Y",nrow(Y))))
+  df1 = rbind(df1,rbind(c(VaR,"VaR"),c(CVaR,"CVaR")))
+  df1 = as.data.frame(df1)
+  colnames(df1) = c("x","y","type")
+  df1[ , 1:2] <- apply(df1[ , 1:2], MARGIN = 2,function(x) as.numeric(x))
+  
+  if(palette==1){
+    cbbPalette <- c("#000000", "#CC79A7", "#009E73", "#000000", "#56B4E9")
+  }else{
+    cbbPalette <- c("#000000", "purple", "#009E73", "#000000", "#E69F00")
+  }
+  p = ggplot() + theme(legend.position = "none",axis.title = element_blank()) + scale_color_manual(values = cbbPalette ) + xlim(0, limx) + ylim(0, limy)
+  p = p + geom_point(df1[df1$type=="Q",],mapping=aes(x=x, y=y,colour=type),size=0.01)
+  p = p + geom_point(df1[df1$type=="S",],mapping=aes(x=x, y=y,colour=type),size=0.01)
+  p = p + geom_point(df1[df1$type=="Y",],mapping=aes(x=x, y=y,colour=type),size=1)
+  p = p + geom_path(df1[df1$type=="Q",],mapping=aes(x=x, y=y,colour=type),linewidth=1) 
+  p = p + geom_path(df1[df1$type=="S",],mapping=aes(x=x, y=y,colour=type),linewidth=1)
+  p = p + geom_point(df1[df1$type=="VaR",],mapping=aes(x=x, y=y,colour=type),size=2,shape=3)
+  p = p + geom_point(df1[df1$type=="CVaR",],mapping=aes(x=x, y=y,colour=type),size=2,shape=4)
+  return(p)
+}
+
+#without the contours : 
+plot_situ <- function(contours,palette,VaR, CVaR, Y,limx,limy){
+  # returns a graph with Y, some contours with respective Var and CVaR
+  # palette must be either 1 or 2
+  # -------------------------------------
+  df1 = cbind(Y,rep("Y",nrow(Y)))
+  df1 = rbind(df1,rbind(c(VaR,"VaR"),c(CVaR,"CVaR")))
+  df1 = as.data.frame(df1)
+  colnames(df1) = c("x","y","type")
+  df1[ , 1:2] <- apply(df1[ , 1:2], MARGIN = 2,function(x) as.numeric(x))
+  
+  if(palette==1){
+    cbbPalette <- c("#000000", "#000000", "#56B4E9")
+  }else{
+    cbbPalette <- c("#000000", "#000000", "#E69F00")
+  }
+  p = ggplot() + theme(legend.position = "none",axis.title = element_blank()) + scale_color_manual(values = cbbPalette ) + xlim(0, limx) + ylim(0, limy)
+  p = p + geom_point(df1[df1$type=="Y",],mapping=aes(x=x, y=y,colour=type),size=1,alpha=0.5)
+  p = p + geom_point(df1[df1$type=="VaR",],mapping=aes(x=x, y=y,colour=type),size=2,shape=3)
+  p = p + geom_point(df1[df1$type=="CVaR",],mapping=aes(x=x, y=y,colour=type),size=2,shape=4)
+  return(p)
+}
+
+risks_plot <- function(Y,limx,limy,palette,tau,eps){
+  #palette must be either 1 or 2 depending on Y1 or Y2
+  calcs = calculs(Y,tau,eps) #here, Y is reduced for computations but not changed. Hereafter, it is in original scale
+  risksY = calcs[[1]]
+  contours = calcs[[2]]
+  VaR = risksY[[1]] ; CVaR = risksY[[2]]
+  p = plot_situ(contours,palette=palette,VaR, CVaR, Y,limx,limy)
+  return(list(risksY,p))
+}
+
+final_plots <- function(Y1,Y2,tau,eps){
+  # returns three plots.
+  # plots 1 and 2 contain contours and VaRs and CVaRs
+  # plot 3 contains the barplot
+  # --------------------------
+  limx = max(max(Y1[,1]),max(Y2[,1])) ; limy = max(max(Y1[,2]),max(Y2[,2]))
+  L1 = risks_plot(Y=Y1,limx,limy,palette=1,tau,eps) #risks and plot for Y1 
+  L2 = risks_plot(Y=Y2,limx,limy,palette=2,tau,eps) #risks and plot for Y2 
+  
+  risks1 = L1[[1]] # list(VaR,CVaR,MC) for situation 1
+  risks2 = L2[[1]] # list(VaR,CVaR,MC) for situation 2
+  
+  risks1 = c(sum(risks1[[1]]),sum(risks1[[2]]),risks1[[3]]) #rhovar, rhocvar, max_corr
+  risks2 = c(sum(risks2[[1]]),sum(risks2[[2]]),risks2[[3]]) #rhovar, rhocvar, max_corr
+  
+  #normalisation to compare the real-valued risks of Y1 and Y2 for each measure
+  for(k in 1:3){
+    mm = max(risks1[k],risks2[k])
+    risks1[k] = risks1[k]/mm
+    risks2[k] = risks2[k]/mm
+  }
+  
+  df <- data.frame(risk=c(risks1,risks2),measure=rep(c("VaR","CVaR","MaxCor"),2),situ=c(rep("1",3),rep("2",3)))
+  
+  p <- ggplot(df, aes(x = measure, y = risk)) +
+    geom_col(aes(color = situ, fill = situ), position = position_dodge(0.8), width = 0.7,alpha=0.5) +
+    scale_color_manual(values = c("#56B4E9", "#E69F00"))+
+    scale_fill_manual(values = c("#56B4E9", "#E69F00")) + theme(legend.position = "none", axis.title.x = element_blank()) + scale_x_discrete(labels=c(TeX("$\\rho^S$"),TeX("$\\rho_C$"),TeX("$\\rho^Q$")))
+  return(list(L1[[2]], L2[[2]],p)) 
+}
+
+```
+
+## Calculus for each situation
+
+
+```{r}
+J = 500  #number of observations for each points cloud.
+d=2
+eps = 0.001
+tau = 0.75 #level of quantiles/superquantiles
+
+# ---- SITUATION A
+mean1 = c(1,3) ; mean2 = mean1
+sigma1 = matrix(c(5,3,3,5),nrow=2,ncol=2) ; sigma2 = sigma1/5
+L = simu(mean1,sigma1,mean2,sigma2,J)
+Y1 = L[[1]] ; Y2 = L[[2]] #here, Y is not reduced
+figureA = final_plots(Y1,Y2,tau,eps)
+
+# ---- SITUATION B
+Y1 = L[[2]]
+Y2 = rbind(Y2[1:496,],matrix(c(18,17,19.8,20.2,21.1,27,22,24.3),ncol=2,nrow=4))
+figureB = final_plots(Y1,Y2,tau,eps)
+
+# ---- SITUATION C
+Y1 = L[[1]]
+Y2 = t(t(Y1) + c(10,0))
+figureC = final_plots(Y1,Y2,tau,eps)
+
+# ---- SITUATION D
+mean1 = c(1,3) ; mean2 = mean1
+sigma1 = matrix(c(3,2.5,2.5,3),nrow=2,ncol=2) 
+sigma2 = matrix(c(0.2,0,0,3),nrow=2,ncol=2) 
+L = simu(mean1,sigma1,mean2,sigma2,J)
+Y1 = L[[1]] ; Y2 = L[[2]] #here, Y is not reduced
+figureD = final_plots(Y1,Y2,tau,eps)
+
+# ---- SITUATION E
+mean1 = c(7,3) 
+mean2 = c(3,7) 
+sigma1 = matrix(c(3,0,0,0.5),nrow=2,ncol=2) 
+sigma2 = matrix(c(0.5,0,0,3),nrow=2,ncol=2) 
+L = simu(mean1,sigma1,mean2,sigma2,J)
+Y1 = L[[1]] ; Y2 = L[[2]] #here, Y is not reduced
+figureE = final_plots(Y1,Y2,tau,eps)
+
+```
+
+```{r final plots }
+figureA[[1]]
+figureA[[2]]
+figureA[[3]]
+figureB[[1]]
+figureB[[2]]
+figureB[[3]]
+figureC[[1]]
+figureC[[2]]
+figureC[[3]]
+figureD[[1]]
+figureD[[2]]
+figureD[[3]]
+figureE[[1]]
+figureE[[2]]
+figureE[[3]]
+```
+
+```{r}
+ggarrange(figureA[[1]],figureA[[2]],figureA[[3]],ncol=3,nrow=2)
+ggsave("toy_ex_1.png")
+ggarrange(figureB[[1]],figureB[[2]],figureB[[3]],ncol=3,nrow=2)
+ggsave("toy_ex_2.png")
+ggarrange(figureC[[1]],figureC[[2]],figureC[[3]],ncol=3,nrow=2)
+ggsave("toy_ex_3.png")
+ggarrange(figureD[[1]],figureD[[2]],figureD[[3]],ncol=3,nrow=2)
+ggsave("toy_ex_4.png")
+ggarrange(figureE[[1]],figureE[[2]],figureE[[3]],ncol=3,nrow=2)
+ggsave("toy_ex_5.png")
+```
+
+
+
+
+
+
+# Q, S and E contours
+
+```{r}
+J = 2000
+mean1 = c(3,-1)
+sigma1 = matrix(c(2,1,1,3),nrow=2,ncol=2)
+Y = mvrnorm(n=J,mu=mean1,Sigma=sigma1)
+
+p <- ggplot(as.data.frame(Y), aes(x = V1, y =  V2))
+p+geom_point()
+```
+
+```{r}
+contours3 <- function(Y,eps,tau,v1,moy,maxY){
+  #--------------
+  # - returns the VaRs, CVaRs (for the 2-norm )
+  #- computes EOT on center-reduced, and returns the results after rescaling in original scale
+  #v1 is the entropic kantorovich potential obtained through the Robbins_Monro_Algo
+  #--------------
+  ncq = 500
+  angles = seq(0,2*pi,length.out=ncq)
+  Ud = matrix(0,nrow=ncq,ncol=d)
+  for(i in seq(1,ncq)){
+    theta = angles[i]
+    u = tau * c(round(cos(theta),3),round(sin(theta),3))
+    Ud[i,] = u
+  }
+  transf_inv <- function(u){return(u * (maxY * 2 ) + moy)}
+  # Quantiles
+  QepsYv <- function(u){return( quantile(eps,u,Y,v1) ) }
+  CQ1 = apply(Ud,MARGIN=1,QepsYv) 
+  CQ1 = apply(CQ1, MARGIN = 2,FUN=transf_inv)
+  #normCQ = apply(CQ1, MARGIN = 2,sum)
+  #VaR = CQ1[,which.max(normCQ)] 
+  # Superquantiles
+  SepsYv <- function(u){return( superquantile(eps,u,Y,v1) )}
+  CSQ1 = apply(Ud,MARGIN=1,SepsYv)
+  CSQ1 = apply(CSQ1, MARGIN = 2,FUN=transf_inv)
+  #normCQ = apply(CSQ1, MARGIN = 2,sum)
+  #CVaR = CSQ1[,which.max(normCQ)]
+  # expected shortfall
+  EepsYv <- function(u){return( expshort(eps,u,Y,v1) )}
+  CE1 = apply(Ud,MARGIN=1,EepsYv)
+  CE1 = apply(CE1, MARGIN = 2,FUN=transf_inv)
+  return( list(CQ1,CSQ1,CE1) )
+}
+```
+
+```{r}
+
+tau = 0.75
+eps = 0.001
+
+# 1) OT part
+
+moy = apply(Y,MARGIN=2,FUN=mean)
+maxY = max(Y)
+transf <- function(u){return( (u - moy)/ (maxY * 2 ) )}
+transf_inv <- function(u){return(u * (maxY * 2 ) + moy)}
+Y = apply(Y,FUN=transf,MARGIN=1)
+Y = t(Y)
+
+v = runif(J)
+v = v - mean(v)
+v = Robbins_Monro_Algo(Y,eps=eps, n_iter=20000,v0=v) 
+
+# 2) compute contours
+res = contours3(Y,eps,tau,v1=v,moy,maxY) 
+CQ = res[[1]]
+CS = res[[2]]
+CE = res[[3]]
+
+# Ud but r is 0.75 
+ncq = 1000
+angles = seq(0,2*pi,length.out=ncq)
+Ud = matrix(0,nrow=ncq,ncol=d)
+for(i in seq(1,ncq)){
+  theta = angles[i]
+  u = tau * c(round(cos(theta),3),round(sin(theta),3))
+  Ud[i,] = u
+}
+CQ = apply(Ud,MARGIN=1,function(u){return(transf_inv(quantile(eps,u,Y,v))) })
+
+# 3) ggplot stuff
+
+df1 = rbind(CQ,rep("Q",1000))
+df2 = rbind(CS,rep("S",1000))
+df1 = cbind(df1,df2)
+df2 = rbind(CE,rep("E",1000))
+df1 = t(cbind(df1,df2))
+
+transf_inv <- function(u){return(u * (maxY * 2 ) + moy)}
+
+# Ud but r between 0 and 0.75
+Ud = matrix(0,nrow=1000,ncol=d)
+for(i in seq(1,1000)){
+  Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+  Z = Z/norm(Z,type='2')
+  Ud[i,] = runif(1,min=0,max=tau)*Z
+}
+Yplot = apply(Ud,MARGIN=1,function(u){return(transf_inv(quantile(eps,u,Y,v))) })
+Yplot = rbind(Yplot,rep("Y1",nrow(Yplot)))
+
+# Ud but r between 0.75 and 1
+Ud = matrix(0,nrow=1000,ncol=d)
+for(i in seq(1,1000)){
+  Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+  Z = Z/norm(Z,type='2')
+  Ud[i,] = runif(1,min=tau,max=1)*Z
+}
+toto = apply(Ud,MARGIN=1,function(u){return(transf_inv(quantile(eps,u,Y,v))) })
+toto = rbind(toto,rep("Y2",nrow(toto)))
+Yplot = cbind(Yplot,toto)
+
+Yplot = t(Yplot)
+df1 = rbind(df1,Yplot)
+df1 = as.data.frame(df1)
+colnames(df1) = c("x","y","type")
+df1[ , 1:2] <- apply(df1[ , 1:2], MARGIN = 2,function(x) as.numeric(x))
+
+cbbPalette <- c("#009E73", "blue", "red", "gray", "purple")
+
+p = ggplot() + theme(axis.title = element_blank(),axis.text= element_blank(),axis.ticks = element_blank()) + scale_color_manual(values = cbbPalette ) 
+p = p + geom_point(df1[df1$type=="Q",],mapping=aes(x=x, y=y,colour=type),size=0.01) + geom_point(df1[df1$type=="S",],mapping=aes(x=x, y=y,colour=type),size=0.01) + geom_point(df1[df1$type=="E",],mapping=aes(x=x, y=y,colour=type),size=0.01) + geom_point(df1[df1$type=="Y1",],mapping=aes(x=x, y=y,colour=type),size=1) + geom_point(df1[df1$type=="Y2",],mapping=aes(x=x, y=y,colour=type),size=1) + geom_path(df1[df1$type=="Q",],mapping=aes(x=x, y=y,colour=type),linewidth=1) + geom_path(df1[df1$type=="S",],mapping=aes(x=x, y=y,colour=type),linewidth=1) + geom_path(df1[df1$type=="E",],mapping=aes(x=x, y=y,colour=type),linewidth=1)
+
+p
+#ggsave("Troiscontours.png",height=2,width=4)
+```
+
+```{r}
+cbbPalette <- c("blue", "black", "gray", rgb(0, 0, 1, 0.5))
+
+p = ggplot() + theme(axis.title = element_blank(),axis.text= element_blank(),axis.ticks = element_blank()) + scale_color_manual(values = cbbPalette ) 
+p = p + geom_point(df1[df1$type=="Q",],mapping=aes(x=x, y=y,colour=type),size=0.01) + geom_point(df1[df1$type=="S",],mapping=aes(x=x, y=y,colour=type),size=0.01) + geom_point(df1[df1$type=="Y1",],mapping=aes(x=x, y=y,colour=type),size=1) + geom_point(df1[df1$type=="Y2",],mapping=aes(x=x, y=y,colour=type),size=1) + geom_path(df1[df1$type=="Q",],mapping=aes(x=x, y=y,colour=type),linewidth=1) + geom_path(df1[df1$type=="S",],mapping=aes(x=x, y=y,colour=type),linewidth=1) 
+p
+```
+
+```{r}
+cbbPalette <- c("black", "blue", rgb(0, 0, 1, 0.5), "gray")
+
+p = ggplot() + theme(legend.position = "none",axis.title = element_blank(),axis.text= element_blank(),axis.ticks = element_blank()) + scale_color_manual(values = cbbPalette ) 
+p = p + geom_point(df1[df1$type=="Q",],mapping=aes(x=x, y=y,colour=type),size=0.01) + geom_point(df1[df1$type=="E",],mapping=aes(x=x, y=y,colour=type),size=0.01) + geom_point(df1[df1$type=="Y1",],mapping=aes(x=x, y=y,colour=type),size=1) + geom_point(df1[df1$type=="Y2",],mapping=aes(x=x, y=y,colour=type),size=1) + geom_path(df1[df1$type=="Q",],mapping=aes(x=x, y=y,colour=type),linewidth=1) + geom_path(df1[df1$type=="E",],mapping=aes(x=x, y=y,colour=type),linewidth=1)
+p
+```
+
+```{r}
+
+# Ud but r between 0 and 0.25
+Ud = matrix(0,nrow=500,ncol=d)
+sphere = matrix(0,nrow=500,ncol=d)
+for(i in seq(1,500)){
+  Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+  Z = Z/norm(Z,type='2')
+  Ud[i,] = runif(1)*Z/4
+  sphere[i,] = Z
+}
+Yplot = apply(Ud,MARGIN=1,function(u){return(transf_inv(quantile(eps,u,Y,v))) })
+Yplot = rbind(Yplot,rep("Y1",nrow(Yplot)))
+
+# Ud but r between 0.25 and 0.75
+Ud = matrix(0,nrow=500,ncol=d)
+for(i in seq(1,500)){
+  Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+  Z = Z/norm(Z,type='2')
+  Ud[i,] = runif(1,min=0.25,max=0.75)*Z
+}
+toto = apply(Ud,MARGIN=1,function(u){return(transf_inv(quantile(eps,u,Y,v))) })
+toto = rbind(toto,rep("Y2",nrow(toto)))
+Yplot = cbind(Yplot,toto)
+
+# Ud but r between 0.75 and 1
+Ud = matrix(0,nrow=500,ncol=d)
+for(i in seq(1,500)){
+  Z = mvrnorm(mu=rep(0,d),Sigma=diag(1,nrow=d,ncol=d))
+  Z = Z/norm(Z,type='2')
+  Ud[i,] = runif(1,min=0.75,max=1)*Z
+}
+toto = apply(Ud,MARGIN=1,function(u){return(transf_inv(quantile(eps,u,Y,v))) })
+toto = rbind(toto,rep("Y3",nrow(toto)))
+Yplot = cbind(Yplot,toto)
+
+Yplot = t(Yplot)
+
+# contours 
+ncq = 1000
+angles = seq(0,2*pi,length.out=ncq)
+sphere = matrix(0,nrow=ncq,ncol=d)
+for(i in seq(1,ncq)){
+  theta = angles[i]
+  u = c(round(cos(theta),3),round(sin(theta),3))
+  sphere[i,] = u
+}
+CQ1 = apply(0.25*sphere,MARGIN=1,function(u){return(transf_inv(quantile(eps,u,Y,v))) })
+CQ2 = apply(0.75*sphere,MARGIN=1,function(u){return(transf_inv(quantile(eps,u,Y,v))) })
+df1 = rbind(CQ1,rep("CQ1",ncq))
+df2 = rbind(CQ2,rep("CQ2",ncq))
+df1 = cbind(df1,df2)
+
+df1 = t(df1)
+
+df1 = rbind(df1,Yplot)
+df1 = as.data.frame(df1)
+colnames(df1) = c("x","y","type")
+df1[ , 1:2] <- apply(df1[ , 1:2], MARGIN = 2,function(x) as.numeric(x))
+```
+
+```{r}
+cbbPalette <- c("blue", "blue", rgb(0, 0, 1, 0.5), "gray",rgb(0, 0, 1, 0.5))
+p4 = ggplot() + theme(axis.title = element_blank(),axis.text= element_blank(),axis.ticks = element_blank()) + scale_color_manual(values = cbbPalette ) 
+p4 = p4 + geom_point(df1[df1$type=="CQ1",],mapping=aes(x=x, y=y,colour=type),size=0.01) + geom_point(df1[df1$type=="CQ2",],mapping=aes(x=x, y=y,colour=type),size=0.01) + geom_point(df1[df1$type=="Y1",],mapping=aes(x=x, y=y,colour=type),size=1) + geom_point(df1[df1$type=="Y2",],mapping=aes(x=x, y=y,colour=type),size=1) + geom_point(df1[df1$type=="Y3",],mapping=aes(x=x, y=y,colour=type),size=1) +geom_path(df1[df1$type=="CQ1",],mapping=aes(x=x, y=y,colour=type),linewidth=1,linetype="dashed") + geom_path(df1[df1$type=="CQ2",],mapping=aes(x=x, y=y,colour=type),linewidth=1) 
+p4
+```
